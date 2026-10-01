@@ -1,1 +1,1137 @@
+get <crates:cranelift-codegen::0.130>
+get <crates:cranelift-frontend::0.130>
+get <crates:cranelift-module::0.130>
+get <crates:cranelift-jit::0.130>
+get <crates:cranelift-native::0.130>
+get <crates:cranelift-reader::0.130>
 
+!! ---------------------------------------------------------------
+!! Modul JIT
+!! ---------------------------------------------------------------
+
+!!! Nowy modul JIT dla procesora, na ktorym dziala program. Zwraca
+!!! uchwyt (> 0) albo 0, gdy hosta nie da sie obsluzyc.
+fun cl_jit_new() -> Int [
+    let handle = 0
+    native {Rust} [
+        use cranelift_codegen::settings::Configurable;
+        type Jit = (cranelift_jit::JITModule, std::collections::HashMap<String, (cranelift_module::FuncId, String, String, String)>, String);
+        let mut flags = cranelift_codegen::settings::builder();
+        let _ = flags.set("use_colocated_libcalls", "false");
+        let _ = flags.set("is_pic", "false");
+        let _ = flags.set("opt_level", "speed");
+        if let Ok(isa_builder) = cranelift_native::builder() {
+            if let Ok(isa) = isa_builder.finish(cranelift_codegen::settings::Flags::new(flags)) {
+                let jb = cranelift_jit::JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+                let module = cranelift_jit::JITModule::new(jb);
+                let state: Jit = (module, std::collections::HashMap::new(), String::new());
+                let boxed: Box<dyn std::any::Any> = Box::new(state);
+                handle = Box::into_raw(Box::new(boxed)) as i64;
+            }
+        }
+    ]
+    end handle
+]
+
+!!! Zwalnia modul JIT razem z kodem maszynowym - wskazniki/wywolania
+!!! funkcji z tego modulu przestaja byc wazne. Uchwyt nie moze byc uzyty
+!!! ponownie.
+fun cl_jit_free(jit: Int) [
+    native {Rust} [
+        type Jit = (cranelift_jit::JITModule, std::collections::HashMap<String, (cranelift_module::FuncId, String, String, String)>, String);
+        if jit != 0 {
+            let outer: Box<Box<dyn std::any::Any>> = unsafe { Box::from_raw(jit as *mut Box<dyn std::any::Any>) };
+            let inner: Box<dyn std::any::Any> = *outer;
+            if let Ok(state) = inner.downcast::<Jit>() {
+                let (module, _map, _error) = *state;
+                unsafe { module.free_memory(); }
+            }
+        }
+    ]
+]
+
+!!! Docelowy trojak hosta, np. "x86_64-unknown-linux-gnu" ("" przy zlym uchwycie).
+fun cl_jit_triple(jit: Int) -> Str [
+    let out = ""
+    native {Rust} [
+        use cranelift_module::Module;
+        type Jit = (cranelift_jit::JITModule, std::collections::HashMap<String, (cranelift_module::FuncId, String, String, String)>, String);
+        if jit != 0 {
+            let any_ref = unsafe { &mut *(jit as *mut Box<dyn std::any::Any>) };
+            if let Some(state) = any_ref.downcast_mut::<Jit>() {
+                out = state.0.isa().triple().to_string();
+            }
+        }
+    ]
+    end out
+]
+
+!!! Ostatni blad modulu (cl_finish / cl_define_clif / cl_call_*), "" gdy brak.
+fun cl_last_error(jit: Int) -> Str [
+    let out = ""
+    native {Rust} [
+        type Jit = (cranelift_jit::JITModule, std::collections::HashMap<String, (cranelift_module::FuncId, String, String, String)>, String);
+        if jit != 0 {
+            let any_ref = unsafe { &mut *(jit as *mut Box<dyn std::any::Any>) };
+            if let Some(state) = any_ref.downcast_mut::<Jit>() {
+                out = state.2.clone();
+            }
+        }
+    ]
+    end out
+]
+
+!!! Czy funkcja `name` jest zdefiniowana lub zadeklarowana w module.
+fun cl_has(jit: Int, name: Str) -> Bool [
+    let found = false
+    native {Rust} [
+        type Jit = (cranelift_jit::JITModule, std::collections::HashMap<String, (cranelift_module::FuncId, String, String, String)>, String);
+        if jit != 0 {
+            let any_ref = unsafe { &mut *(jit as *mut Box<dyn std::any::Any>) };
+            if let Some(state) = any_ref.downcast_mut::<Jit>() {
+                found = state.1.contains_key(name.as_str());
+            }
+        }
+    ]
+    end found
+]
+
+!!! Sygnatura funkcji w formie "ii->i" ("" gdy nieznana).
+fun cl_signature(jit: Int, name: Str) -> Str [
+    let out = ""
+    native {Rust} [
+        type Jit = (cranelift_jit::JITModule, std::collections::HashMap<String, (cranelift_module::FuncId, String, String, String)>, String);
+        if jit != 0 {
+            let any_ref = unsafe { &mut *(jit as *mut Box<dyn std::any::Any>) };
+            if let Some(state) = any_ref.downcast_mut::<Jit>() {
+                if let Some(entry) = state.1.get(name.as_str()) {
+                    out = format!("{}->{}", entry.1, entry.2);
+                }
+            }
+        }
+    ]
+    end out
+]
+
+!!! Tekst CLIF funkcji `name` po zbudowaniu (przed optymalizacja), do
+!!! debugowania ("" gdy brak).
+fun cl_clif(jit: Int, name: Str) -> Str [
+    let out = ""
+    native {Rust} [
+        type Jit = (cranelift_jit::JITModule, std::collections::HashMap<String, (cranelift_module::FuncId, String, String, String)>, String);
+        if jit != 0 {
+            let any_ref = unsafe { &mut *(jit as *mut Box<dyn std::any::Any>) };
+            if let Some(state) = any_ref.downcast_mut::<Jit>() {
+                if let Some(entry) = state.1.get(name.as_str()) {
+                    out = entry.3.clone();
+                }
+            }
+        }
+    ]
+    end out
+]
+
+!!! Deklaruje funkcje bez ciala (zeby inna funkcja mogla ja wolac przed
+!!! zdefiniowaniem, np. rekurencja wzajemna). Zwraca "" albo opis bledu.
+fun cl_declare(jit: Int, name: Str, params: Str, rets: Str) -> Str [
+    let error = ""
+    native {Rust} [
+        use cranelift_codegen::ir::{types, AbiParam};
+        use cranelift_module::{Linkage, Module};
+        type Jit = (cranelift_jit::JITModule, std::collections::HashMap<String, (cranelift_module::FuncId, String, String, String)>, String);
+        fn ty_of(c: char) -> Option<cranelift_codegen::ir::Type> {
+            match c {
+                'i' => Some(types::I64),
+                'f' => Some(types::F64),
+                'w' => Some(types::I32),
+                'b' => Some(types::I8),
+                _ => None,
+            }
+        }
+        if jit == 0 {
+            error = "zly uchwyt jit".to_string();
+        } else {
+            let any_ref = unsafe { &mut *(jit as *mut Box<dyn std::any::Any>) };
+            match any_ref.downcast_mut::<Jit>() {
+                None => {
+                    error = "zly uchwyt jit".to_string();
+                }
+                Some(state) => {
+                    let mut sig = state.0.make_signature();
+                    let mut bad = false;
+                    for c in params.chars() {
+                        match ty_of(c) {
+                            Some(t) => sig.params.push(AbiParam::new(t)),
+                            None => bad = true,
+                        }
+                    }
+                    for c in rets.chars() {
+                        match ty_of(c) {
+                            Some(t) => sig.returns.push(AbiParam::new(t)),
+                            None => bad = true,
+                        }
+                    }
+                    if bad {
+                        error = "nieznany typ w sygnaturze (dozwolone: i f w b)".to_string();
+                    } else {
+                        match state.0.declare_function(name.as_str(), Linkage::Export, &sig) {
+                            Ok(id) => {
+                                state.1.insert(name.to_string(), (id, params.to_string(), rets.to_string(), String::new()));
+                            }
+                            Err(e) => {
+                                error = e.to_string();
+                            }
+                        }
+                    }
+                }
+            }
+            if !error.is_empty() {
+                if let Some(state) = any_ref.downcast_mut::<Jit>() {
+                    state.2 = error.clone();
+                }
+            }
+        }
+    ]
+    end error
+]
+
+!! ---------------------------------------------------------------
+!! Budowanie funkcji (zapis instrukcji)
+!! ---------------------------------------------------------------
+
+!!! Zaczyna funkcje `name` o parametrach `params` i wynikach `rets` (patrz
+!!! typy na gorze pliku; rets "" = brak wyniku). Zwraca uchwyt f (> 0).
+!!! Blok 0 jest juz utworzony i aktywny.
+fun cl_fn_new(name: Str, params: Str, rets: Str) -> Int [
+    let handle = 0
+    native {Rust} [
+        type Rec = (String, String, String, Vec<[i64; 6]>, Vec<Vec<i64>>, Vec<String>, i64, Vec<(i64, String)>, String);
+        let count: i64 = params.chars().count() as i64;
+        let rec: Rec = (
+            name.to_string(),
+            params.to_string(),
+            rets.to_string(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            count,
+            vec![(0i64, params.to_string())],
+            String::new(),
+        );
+        let boxed: Box<dyn std::any::Any> = Box::new(rec);
+        handle = Box::into_raw(Box::new(boxed)) as i64;
+    ]
+    end handle
+]
+
+!!! Zwalnia zapis funkcji (po cl_finish nie jest juz potrzebny).
+fun cl_fn_free(f: Int) [
+    native {Rust} [
+        if f != 0 {
+            let outer: Box<Box<dyn std::any::Any>> = unsafe { Box::from_raw(f as *mut Box<dyn std::any::Any>) };
+            drop(outer);
+        }
+    ]
+]
+
+!!! Ostatni blad budowanej funkcji ("" gdy brak).
+fun cl_fn_error(f: Int) -> Str [
+    let out = ""
+    native {Rust} [
+        type Rec = (String, String, String, Vec<[i64; 6]>, Vec<Vec<i64>>, Vec<String>, i64, Vec<(i64, String)>, String);
+        if f != 0 {
+            let any_ref = unsafe { &mut *(f as *mut Box<dyn std::any::Any>) };
+            if let Some(rec) = any_ref.downcast_mut::<Rec>() {
+                out = rec.8.clone();
+            }
+        }
+    ]
+    end out
+]
+
+!!! Rdzen zapisu - uzywaj opakowan cl_iadd, cl_icmp, cl_jump itd. Kody `op`:
+!!! 1 iconst(a=wartosc)  2 fconst(a=bity f64)  3 binop(a=rodzaj,b,c)
+!!! 4 unop(a=rodzaj,b)  5 icmp(a=warunek,b,c)  6 fcmp(a=warunek,b,c)
+!!! 7 select(a=warunek,b,c)  8 switch(a=blok)  9 jump(a=blok,list)
+!!! 10 brif(a=warunek,b=blok_then,c=blok_else,list=args_then,-1,args_else)
+!!! 11 return(a=wartosc lub -1)  12 call(text=nazwa,list=args)
+!!! 13 nowy blok(text=typy)  14 parametr bloku(a=blok,b=nr)
+!!! 15 parametr funkcji(a=nr). Zwraca numer wartosci/bloku albo -1
+!!! (powod: cl_fn_error); operacje bez wyniku zwracaja 0.
+fun cl_emit(f: Int, op: Int, a: Int, b: Int, c: Int, list: List<Int>, text: Str) -> Int [
+    let result = -1
+    native {Rust} [
+        type Rec = (String, String, String, Vec<[i64; 6]>, Vec<Vec<i64>>, Vec<String>, i64, Vec<(i64, String)>, String);
+        fn alloc(rec: &mut Rec) -> i64 {
+            let id: i64 = rec.6;
+            rec.6 += 1;
+            id
+        }
+        if f != 0 {
+            let any_ref = unsafe { &mut *(f as *mut Box<dyn std::any::Any>) };
+            if let Some(rec) = any_ref.downcast_mut::<Rec>() {
+                let next: i64 = rec.6;
+                let nblocks: i64 = rec.7.len() as i64;
+                let is_val = |v: i64| -> bool { v >= 0 && v < next };
+                let is_blk = |v: i64| -> bool { v >= 0 && v < nblocks };
+                let outcome: Result<(Option<[i64; 6]>, i64), String> = match op {
+                    1 | 2 => {
+                        let id = alloc(rec);
+                        Ok((Some([op, a, 0, 0, 0, id]), id))
+                    }
+                    3 => {
+                        if !(a >= 0 && a <= 16) {
+                            Err("binop: nieznany rodzaj".to_string())
+                        } else if !(is_val(b) && is_val(c)) {
+                            Err("binop: zla wartosc".to_string())
+                        } else {
+                            let id = alloc(rec);
+                            Ok((Some([3, a, b, c, 0, id]), id))
+                        }
+                    }
+                    4 => {
+                        if !(a >= 0 && a <= 7) {
+                            Err("unop: nieznany rodzaj".to_string())
+                        } else if !is_val(b) {
+                            Err("unop: zla wartosc".to_string())
+                        } else {
+                            let id = alloc(rec);
+                            Ok((Some([4, a, b, 0, 0, id]), id))
+                        }
+                    }
+                    5 => {
+                        if !(a >= 0 && a <= 9) {
+                            Err("icmp: nieznany warunek".to_string())
+                        } else if !(is_val(b) && is_val(c)) {
+                            Err("icmp: zla wartosc".to_string())
+                        } else {
+                            let id = alloc(rec);
+                            Ok((Some([5, a, b, c, 0, id]), id))
+                        }
+                    }
+                    6 => {
+                        if !(a >= 0 && a <= 5) {
+                            Err("fcmp: nieznany warunek".to_string())
+                        } else if !(is_val(b) && is_val(c)) {
+                            Err("fcmp: zla wartosc".to_string())
+                        } else {
+                            let id = alloc(rec);
+                            Ok((Some([6, a, b, c, 0, id]), id))
+                        }
+                    }
+                    7 => {
+                        if !(is_val(a) && is_val(b) && is_val(c)) {
+                            Err("select: zla wartosc".to_string())
+                        } else {
+                            let id = alloc(rec);
+                            Ok((Some([7, a, b, c, 0, id]), id))
+                        }
+                    }
+                    8 => {
+                        if !is_blk(a) {
+                            Err("switch: zly blok".to_string())
+                        } else {
+                            Ok((Some([8, a, 0, 0, 0, -1]), 0))
+                        }
+                    }
+                    9 => {
+                        if !is_blk(a) {
+                            Err("jump: zly blok".to_string())
+                        } else if !list.iter().all(|v| is_val(*v)) {
+                            Err("jump: zla wartosc w argumentach".to_string())
+                        } else {
+                            let li = rec.4.len() as i64;
+                            rec.4.push(list.clone());
+                            Ok((Some([9, a, li, 0, 0, -1]), 0))
+                        }
+                    }
+                    10 => {
+                        if !(is_val(a) && is_blk(b) && is_blk(c)) {
+                            Err("brif: zly warunek lub blok".to_string())
+                        } else if !list.iter().all(|v| *v == -1 || is_val(*v)) {
+                            Err("brif: zla wartosc w argumentach".to_string())
+                        } else if list.iter().filter(|v| **v == -1).count() != 1 {
+                            Err("brif: argumenty musza miec dokladnie jeden separator -1".to_string())
+                        } else {
+                            let li = rec.4.len() as i64;
+                            rec.4.push(list.clone());
+                            Ok((Some([10, a, b, c, li, -1]), 0))
+                        }
+                    }
+                    11 => {
+                        if a != -1 && !is_val(a) {
+                            Err("return: zla wartosc".to_string())
+                        } else {
+                            Ok((Some([11, a, 0, 0, 0, -1]), 0))
+                        }
+                    }
+                    12 => {
+                        if !list.iter().all(|v| is_val(*v)) {
+                            Err("call: zla wartosc w argumentach".to_string())
+                        } else {
+                            let li = rec.4.len() as i64;
+                            rec.4.push(list.clone());
+                            let ni = rec.5.len() as i64;
+                            rec.5.push(text.to_string());
+                            let id = alloc(rec);
+                            Ok((Some([12, ni, li, 0, 0, id]), id))
+                        }
+                    }
+                    13 => {
+                        if !text.chars().all(|ch| ch == 'i' || ch == 'f' || ch == 'w' || ch == 'b') {
+                            Err("blok: nieznany typ parametru (dozwolone: i f w b)".to_string())
+                        } else {
+                            let base: i64 = rec.6;
+                            rec.6 += text.chars().count() as i64;
+                            rec.7.push((base, text.to_string()));
+                            Ok((Some([13, nblocks, 0, 0, 0, -1]), nblocks))
+                        }
+                    }
+                    14 => {
+                        if !is_blk(a) {
+                            Err("block_param: zly blok".to_string())
+                        } else {
+                            let (base, types) = rec.7[a as usize].clone();
+                            if b >= 0 && b < types.chars().count() as i64 {
+                                Ok((None, base + b))
+                            } else {
+                                Err("block_param: zly numer parametru".to_string())
+                            }
+                        }
+                    }
+                    15 => {
+                        let count: i64 = rec.1.chars().count() as i64;
+                        if a >= 0 && a < count {
+                            Ok((None, a))
+                        } else {
+                            Err("param: zly numer parametru".to_string())
+                        }
+                    }
+                    _ => Err("nieznany kod operacji".to_string()),
+                };
+                match outcome {
+                    Err(message) => {
+                        rec.8 = message;
+                    }
+                    Ok((entry, value)) => {
+                        if let Some(e) = entry {
+                            rec.3.push(e);
+                        }
+                        result = value;
+                    }
+                }
+            }
+        }
+    ]
+    end result
+]
+
+!! ---------------------------------------------------------------
+!! Kompilacja
+!! ---------------------------------------------------------------
+
+!!! Odtwarza zapisane instrukcje przez FunctionBuilder, weryfikuje IR i
+!!! kompiluje funkcje do kodu maszynowego w module `jit`. Kazdy blok musi
+!!! konczyc sie jump/brif/return. Zwraca "" albo opis bledu (ten sam tekst
+!!! jest tez w cl_last_error).
+fun cl_finish(jit: Int, f: Int) -> Str [
+    let error = ""
+    native {Rust} [
+        use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+        use cranelift_codegen::ir::{types, AbiParam, BlockArg, InstBuilder, Value};
+        use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+        use cranelift_module::{Linkage, Module};
+        type Jit = (cranelift_jit::JITModule, std::collections::HashMap<String, (cranelift_module::FuncId, String, String, String)>, String);
+        type Rec = (String, String, String, Vec<[i64; 6]>, Vec<Vec<i64>>, Vec<String>, i64, Vec<(i64, String)>, String);
+        fn ty_of(c: char) -> Option<cranelift_codegen::ir::Type> {
+            match c {
+                'i' => Some(types::I64),
+                'f' => Some(types::F64),
+                'w' => Some(types::I32),
+                'b' => Some(types::I8),
+                _ => None,
+            }
+        }
+        fn mod_err(e: cranelift_module::ModuleError) -> String {
+            match e {
+                cranelift_module::ModuleError::Compilation(cranelift_codegen::CodegenError::Verifier(v)) => format!("weryfikator IR: {}", v),
+                other => other.to_string(),
+            }
+        }
+        fn filled(b: &FunctionBuilder<'_>, blk: cranelift_codegen::ir::Block) -> bool {
+            match b.func.layout.last_inst(blk) {
+                Some(inst) => b.func.dfg.insts[inst].opcode().is_terminator(),
+                None => false,
+            }
+        }
+        if jit == 0 || f == 0 {
+            error = "zly uchwyt jit lub funkcji".to_string();
+        } else {
+            let jit_any = unsafe { &mut *(jit as *mut Box<dyn std::any::Any>) };
+            let rec_any = unsafe { &mut *(f as *mut Box<dyn std::any::Any>) };
+            match (jit_any.downcast_mut::<Jit>(), rec_any.downcast_mut::<Rec>()) {
+                (Some(state), Some(rec)) => {
+                    let outcome: Result<(cranelift_module::FuncId, String, String, String), String> = (|| {
+                        let m = &mut state.0;
+                        let map = &state.1;
+                        let mut sig = m.make_signature();
+                        for c in rec.1.chars() {
+                            sig.params.push(AbiParam::new(ty_of(c).ok_or("nieznany typ parametru funkcji".to_string())?));
+                        }
+                        for c in rec.2.chars() {
+                            sig.returns.push(AbiParam::new(ty_of(c).ok_or("nieznany typ wyniku funkcji".to_string())?));
+                        }
+                        let func_id = m.declare_function(rec.0.as_str(), Linkage::Export, &sig).map_err(|e| e.to_string())?;
+                        let mut ctx = m.make_context();
+                        ctx.func.signature = sig;
+                        let mut fctx = FunctionBuilderContext::new();
+                        {
+                            let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
+                            let mut vals: Vec<Option<Value>> = vec![None; rec.6 as usize];
+                            let mut blocks = Vec::new();
+                            for (i, (base, types_str)) in rec.7.iter().enumerate() {
+                                let blk = b.create_block();
+                                if i == 0 {
+                                    b.append_block_params_for_function_params(blk);
+                                } else {
+                                    for c in types_str.chars() {
+                                        b.append_block_param(blk, ty_of(c).ok_or("nieznany typ parametru bloku".to_string())?);
+                                    }
+                                }
+                                for (k, v) in b.block_params(blk).iter().enumerate() {
+                                    vals[(*base as usize) + k] = Some(*v);
+                                }
+                                blocks.push(blk);
+                            }
+                            let mut visited = vec![false; blocks.len()];
+                            let mut cur: usize = 0;
+                            visited[0] = true;
+                            b.switch_to_block(blocks[0]);
+                            let get = |vals: &Vec<Option<Value>>, id: i64| -> Result<Value, String> {
+                                if id < 0 {
+                                    return Err("zla wartosc".to_string());
+                                }
+                                match vals.get(id as usize).copied().flatten() {
+                                    Some(v) => Ok(v),
+                                    None => Err(format!("wartosc {} nie istnieje (instrukcja bez wyniku?)", id)),
+                                }
+                            };
+                            for op in rec.3.iter() {
+                                let code = op[0];
+                                let id = op[5];
+                                match code {
+                                    13 => {}
+                                    1 => {
+                                        vals[id as usize] = Some(b.ins().iconst(types::I64, op[1]));
+                                    }
+                                    2 => {
+                                        vals[id as usize] = Some(b.ins().f64const(f64::from_bits(op[1] as u64)));
+                                    }
+                                    3 => {
+                                        let x = get(&vals, op[2])?;
+                                        let y = get(&vals, op[3])?;
+                                        let r = match op[1] {
+                                            0 => b.ins().iadd(x, y),
+                                            1 => b.ins().isub(x, y),
+                                            2 => b.ins().imul(x, y),
+                                            3 => b.ins().sdiv(x, y),
+                                            4 => b.ins().udiv(x, y),
+                                            5 => b.ins().srem(x, y),
+                                            6 => b.ins().urem(x, y),
+                                            7 => b.ins().band(x, y),
+                                            8 => b.ins().bor(x, y),
+                                            9 => b.ins().bxor(x, y),
+                                            10 => b.ins().ishl(x, y),
+                                            11 => b.ins().sshr(x, y),
+                                            12 => b.ins().ushr(x, y),
+                                            13 => b.ins().fadd(x, y),
+                                            14 => b.ins().fsub(x, y),
+                                            15 => b.ins().fmul(x, y),
+                                            _ => b.ins().fdiv(x, y),
+                                        };
+                                        vals[id as usize] = Some(r);
+                                    }
+                                    4 => {
+                                        let x = get(&vals, op[2])?;
+                                        let r = match op[1] {
+                                            0 => b.ins().ineg(x),
+                                            1 => b.ins().bnot(x),
+                                            2 => b.ins().fneg(x),
+                                            3 => b.ins().sqrt(x),
+                                            4 => b.ins().fabs(x),
+                                            5 => b.ins().fcvt_from_sint(types::F64, x),
+                                            6 => b.ins().fcvt_to_sint_sat(types::I64, x),
+                                            _ => b.ins().uextend(types::I64, x),
+                                        };
+                                        vals[id as usize] = Some(r);
+                                    }
+                                    5 => {
+                                        let x = get(&vals, op[2])?;
+                                        let y = get(&vals, op[3])?;
+                                        let cc = match op[1] {
+                                            0 => IntCC::Equal,
+                                            1 => IntCC::NotEqual,
+                                            2 => IntCC::SignedLessThan,
+                                            3 => IntCC::SignedLessThanOrEqual,
+                                            4 => IntCC::SignedGreaterThan,
+                                            5 => IntCC::SignedGreaterThanOrEqual,
+                                            6 => IntCC::UnsignedLessThan,
+                                            7 => IntCC::UnsignedLessThanOrEqual,
+                                            8 => IntCC::UnsignedGreaterThan,
+                                            _ => IntCC::UnsignedGreaterThanOrEqual,
+                                        };
+                                        vals[id as usize] = Some(b.ins().icmp(cc, x, y));
+                                    }
+                                    6 => {
+                                        let x = get(&vals, op[2])?;
+                                        let y = get(&vals, op[3])?;
+                                        let cc = match op[1] {
+                                            0 => FloatCC::Equal,
+                                            1 => FloatCC::NotEqual,
+                                            2 => FloatCC::LessThan,
+                                            3 => FloatCC::LessThanOrEqual,
+                                            4 => FloatCC::GreaterThan,
+                                            _ => FloatCC::GreaterThanOrEqual,
+                                        };
+                                        vals[id as usize] = Some(b.ins().fcmp(cc, x, y));
+                                    }
+                                    7 => {
+                                        let cnd = get(&vals, op[1])?;
+                                        let x = get(&vals, op[2])?;
+                                        let y = get(&vals, op[3])?;
+                                        vals[id as usize] = Some(b.ins().select(cnd, x, y));
+                                    }
+                                    8 => {
+                                        if !filled(&b, blocks[cur]) {
+                                            return Err(format!("blok {} nie konczy sie jump/brif/return", cur));
+                                        }
+                                        cur = op[1] as usize;
+                                        if visited[cur] {
+                                            return Err(format!("blok {} aktywowany drugi raz", cur));
+                                        }
+                                        visited[cur] = true;
+                                        b.switch_to_block(blocks[cur]);
+                                    }
+                                    9 => {
+                                        let mut args: Vec<BlockArg> = Vec::new();
+                                        for vid in rec.4[op[2] as usize].iter() {
+                                            args.push(BlockArg::Value(get(&vals, *vid)?));
+                                        }
+                                        b.ins().jump(blocks[op[1] as usize], &args);
+                                    }
+                                    10 => {
+                                        let cnd = get(&vals, op[1])?;
+                                        let mut then_args: Vec<BlockArg> = Vec::new();
+                                        let mut else_args: Vec<BlockArg> = Vec::new();
+                                        let mut in_else = false;
+                                        for vid in rec.4[op[4] as usize].iter() {
+                                            if *vid == -1 {
+                                                in_else = true;
+                                            } else if in_else {
+                                                else_args.push(BlockArg::Value(get(&vals, *vid)?));
+                                            } else {
+                                                then_args.push(BlockArg::Value(get(&vals, *vid)?));
+                                            }
+                                        }
+                                        b.ins().brif(cnd, blocks[op[2] as usize], &then_args, blocks[op[3] as usize], &else_args);
+                                    }
+                                    11 => {
+                                        if op[1] == -1 {
+                                            b.ins().return_(&[]);
+                                        } else {
+                                            let v = get(&vals, op[1])?;
+                                            b.ins().return_(&[v]);
+                                        }
+                                    }
+                                    _ => {
+                                        let callee = rec.5[op[1] as usize].clone();
+                                        let entry = map.get(callee.as_str()).ok_or(format!("call: funkcja '{}' nie jest zadeklarowana (cl_declare)", callee))?;
+                                        let fref = m.declare_func_in_func(entry.0, b.func);
+                                        let mut args: Vec<Value> = Vec::new();
+                                        for vid in rec.4[op[2] as usize].iter() {
+                                            args.push(get(&vals, *vid)?);
+                                        }
+                                        let inst = b.ins().call(fref, &args);
+                                        vals[id as usize] = b.inst_results(inst).first().copied();
+                                    }
+                                }
+                            }
+                            if !filled(&b, blocks[cur]) {
+                                return Err(format!("blok {} nie konczy sie jump/brif/return", cur));
+                            }
+                            if let Some(missing) = visited.iter().position(|v| !*v) {
+                                return Err(format!("blok {} utworzony, ale nigdy nie aktywowany (cl_switch)", missing));
+                            }
+                            b.seal_all_blocks();
+                            b.finalize();
+                        }
+                        let clif_text = format!("{}", ctx.func);
+                        m.define_function(func_id, &mut ctx).map_err(mod_err)?;
+                        m.clear_context(&mut ctx);
+                        Ok((func_id, rec.1.clone(), rec.2.clone(), clif_text))
+                    })();
+                    match outcome {
+                        Ok((id, p, r, clif_text)) => {
+                            state.1.insert(rec.0.clone(), (id, p, r, clif_text));
+                            state.2 = String::new();
+                        }
+                        Err(message) => {
+                            error = message.clone();
+                            state.2 = message;
+                        }
+                    }
+                }
+                _ => {
+                    error = "zly uchwyt jit lub funkcji".to_string();
+                }
+            }
+        }
+    ]
+    end error
+]
+
+!!! Definiuje funkcje z gotowego tekstu CLIF (jedna funkcja; jej wlasna
+!!! nazwa z tekstu jest ignorowana, liczy sie `name`). Zwraca "" albo
+!!! opis bledu. Calling convention jest ustawiana na natywna. Funkcje
+!!! wolane z tekstu nie sa obslugiwane - uzyj budowania (cl_call).
+fun cl_define_clif(jit: Int, name: Str, text: Str) -> Str [
+    let error = ""
+    native {Rust} [
+        use cranelift_codegen::ir::types;
+        use cranelift_module::{Linkage, Module};
+        type Jit = (cranelift_jit::JITModule, std::collections::HashMap<String, (cranelift_module::FuncId, String, String, String)>, String);
+        fn mod_err(e: cranelift_module::ModuleError) -> String {
+            match e {
+                cranelift_module::ModuleError::Compilation(cranelift_codegen::CodegenError::Verifier(v)) => format!("weryfikator IR: {}", v),
+                other => other.to_string(),
+            }
+        }
+        fn letter(t: cranelift_codegen::ir::Type) -> char {
+            if t == types::I64 {
+                'i'
+            } else if t == types::F64 {
+                'f'
+            } else if t == types::I32 {
+                'w'
+            } else if t == types::I8 {
+                'b'
+            } else {
+                '?'
+            }
+        }
+        if jit == 0 {
+            error = "zly uchwyt jit".to_string();
+        } else {
+            let any_ref = unsafe { &mut *(jit as *mut Box<dyn std::any::Any>) };
+            match any_ref.downcast_mut::<Jit>() {
+                None => {
+                    error = "zly uchwyt jit".to_string();
+                }
+                Some(state) => {
+                    let outcome: Result<(), String> = (|| {
+                        let mut funcs = cranelift_reader::parse_functions(text.as_str()).map_err(|e| e.to_string())?;
+                        if funcs.is_empty() {
+                            return Err("brak funkcji w tekscie CLIF".to_string());
+                        }
+                        let mut func = funcs.remove(0);
+                        let m = &mut state.0;
+                        func.signature.call_conv = m.isa().default_call_conv();
+                        let p: String = func.signature.params.iter().map(|a| letter(a.value_type)).collect();
+                        let r: String = func.signature.returns.iter().map(|a| letter(a.value_type)).collect();
+                        let id = m.declare_function(name.as_str(), Linkage::Export, &func.signature).map_err(|e| e.to_string())?;
+                        let clif_text = format!("{}", func);
+                        let mut ctx = m.make_context();
+                        ctx.func = func;
+                        m.define_function(id, &mut ctx).map_err(mod_err)?;
+                        m.clear_context(&mut ctx);
+                        state.1.insert(name.to_string(), (id, p, r, clif_text));
+                        Ok(())
+                    })();
+                    match outcome {
+                        Ok(_) => {
+                            state.2 = String::new();
+                        }
+                        Err(message) => {
+                            error = message.clone();
+                            state.2 = message;
+                        }
+                    }
+                }
+            }
+        }
+    ]
+    end error
+]
+
+!! ---------------------------------------------------------------
+!! Wywolywanie skompilowanych funkcji
+!! ---------------------------------------------------------------
+
+!!! Wola funkcje o parametrach wylacznie i64 (0-6) i wyniku i64 albo bez
+!!! wyniku (wtedy 0). Przy bledzie zwraca 0 - sprawdz cl_last_error(jit).
+fun cl_call_i(jit: Int, name: Str, args: List<Int>) -> Int [
+    let out = 0
+    native {Rust} [
+        type Jit = (cranelift_jit::JITModule, std::collections::HashMap<String, (cranelift_module::FuncId, String, String, String)>, String);
+        if jit != 0 {
+            let any_ref = unsafe { &mut *(jit as *mut Box<dyn std::any::Any>) };
+            if let Some(state) = any_ref.downcast_mut::<Jit>() {
+                let outcome: Result<i64, String> = (|| {
+                    let (id, params, rets) = match state.1.get(name.as_str()) {
+                        Some(e) => (e.0, e.1.clone(), e.2.clone()),
+                        None => return Err(format!("funkcja '{}' nie istnieje", name)),
+                    };
+                    if !params.chars().all(|c| c == 'i') || params.chars().count() != args.len() {
+                        return Err(format!("sygnatura {}->{} nie pasuje do {} argumentow i64", params, rets, args.len()));
+                    }
+                    if !(rets == "i" || rets.is_empty()) {
+                        return Err(format!("wynik '{}' nie jest i64 (uzyj cl_call_f)", rets));
+                    }
+                    state.0.finalize_definitions().map_err(|e| e.to_string())?;
+                    let code = state.0.get_finalized_function(id);
+                    let has_ret = !rets.is_empty();
+                    let a = &args;
+                    let value: i64 = unsafe {
+                        match a.len() {
+                            0 => {
+                                let g: extern "C" fn() -> i64 = std::mem::transmute(code);
+                                g()
+                            }
+                            1 => {
+                                let g: extern "C" fn(i64) -> i64 = std::mem::transmute(code);
+                                g(a[0])
+                            }
+                            2 => {
+                                let g: extern "C" fn(i64, i64) -> i64 = std::mem::transmute(code);
+                                g(a[0], a[1])
+                            }
+                            3 => {
+                                let g: extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(code);
+                                g(a[0], a[1], a[2])
+                            }
+                            4 => {
+                                let g: extern "C" fn(i64, i64, i64, i64) -> i64 = std::mem::transmute(code);
+                                g(a[0], a[1], a[2], a[3])
+                            }
+                            5 => {
+                                let g: extern "C" fn(i64, i64, i64, i64, i64) -> i64 = std::mem::transmute(code);
+                                g(a[0], a[1], a[2], a[3], a[4])
+                            }
+                            6 => {
+                                let g: extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64 = std::mem::transmute(code);
+                                g(a[0], a[1], a[2], a[3], a[4], a[5])
+                            }
+                            _ => return Err("wiecej niz 6 argumentow".to_string()),
+                        }
+                    };
+                    Ok(if has_ret { value } else { 0 })
+                })();
+                match outcome {
+                    Ok(v) => {
+                        out = v;
+                        state.2 = String::new();
+                    }
+                    Err(message) => {
+                        state.2 = message;
+                    }
+                }
+            }
+        }
+    ]
+    end out
+]
+
+!!! Wola funkcje o parametrach wylacznie f64 (0-4) i wyniku f64. Przy
+!!! bledzie zwraca 0.0 - sprawdz cl_last_error(jit).
+fun cl_call_f(jit: Int, name: Str, args: List<Float>) -> Float [
+    let out = 0.0
+    native {Rust} [
+        type Jit = (cranelift_jit::JITModule, std::collections::HashMap<String, (cranelift_module::FuncId, String, String, String)>, String);
+        if jit != 0 {
+            let any_ref = unsafe { &mut *(jit as *mut Box<dyn std::any::Any>) };
+            if let Some(state) = any_ref.downcast_mut::<Jit>() {
+                let outcome: Result<f64, String> = (|| {
+                    let (id, params, rets) = match state.1.get(name.as_str()) {
+                        Some(e) => (e.0, e.1.clone(), e.2.clone()),
+                        None => return Err(format!("funkcja '{}' nie istnieje", name)),
+                    };
+                    if !params.chars().all(|c| c == 'f') || params.chars().count() != args.len() {
+                        return Err(format!("sygnatura {}->{} nie pasuje do {} argumentow f64", params, rets, args.len()));
+                    }
+                    if rets != "f" {
+                        return Err(format!("wynik '{}' nie jest f64 (uzyj cl_call_i)", rets));
+                    }
+                    state.0.finalize_definitions().map_err(|e| e.to_string())?;
+                    let code = state.0.get_finalized_function(id);
+                    let a = &args;
+                    let value: f64 = unsafe {
+                        match a.len() {
+                            0 => {
+                                let g: extern "C" fn() -> f64 = std::mem::transmute(code);
+                                g()
+                            }
+                            1 => {
+                                let g: extern "C" fn(f64) -> f64 = std::mem::transmute(code);
+                                g(a[0])
+                            }
+                            2 => {
+                                let g: extern "C" fn(f64, f64) -> f64 = std::mem::transmute(code);
+                                g(a[0], a[1])
+                            }
+                            3 => {
+                                let g: extern "C" fn(f64, f64, f64) -> f64 = std::mem::transmute(code);
+                                g(a[0], a[1], a[2])
+                            }
+                            4 => {
+                                let g: extern "C" fn(f64, f64, f64, f64) -> f64 = std::mem::transmute(code);
+                                g(a[0], a[1], a[2], a[3])
+                            }
+                            _ => return Err("wiecej niz 4 argumenty".to_string()),
+                        }
+                    };
+                    Ok(value)
+                })();
+                match outcome {
+                    Ok(v) => {
+                        out = v;
+                        state.2 = String::new();
+                    }
+                    Err(message) => {
+                        state.2 = message;
+                    }
+                }
+            }
+        }
+    ]
+    end out
+]
+
+!! ---------------------------------------------------------------
+!! Opakowania instrukcji (wszystkie przez cl_emit)
+!! ---------------------------------------------------------------
+
+!!! Numer wartosci parametru funkcji (0 = pierwszy).
+fun cl_param(f: Int, index: Int) -> Int [
+    let no_args: List<Int> = []
+    end cl_emit(f, 15, index, 0, 0, no_args, "")
+]
+
+!!! Nowy blok o parametrach `types` (np. "i" albo "" bez parametrow).
+!!! Zwraca numer bloku (>= 1). Blok trzeba aktywowac cl_switch.
+fun cl_block(f: Int, types: Str) -> Int [
+    let no_args: List<Int> = []
+    end cl_emit(f, 13, 0, 0, 0, no_args, types)
+]
+
+!!! Numer wartosci `index`-tego parametru bloku.
+fun cl_block_param(f: Int, block: Int, index: Int) -> Int [
+    let no_args: List<Int> = []
+    end cl_emit(f, 14, block, index, 0, no_args, "")
+]
+
+!!! Przelacza zapis na blok `block` (poprzedni musi byc zakonczony).
+fun cl_switch(f: Int, block: Int) -> Int [
+    let no_args: List<Int> = []
+    end cl_emit(f, 8, block, 0, 0, no_args, "")
+]
+
+!!! Stala i64.
+fun cl_iconst(f: Int, n: Int) -> Int [
+    let no_args: List<Int> = []
+    end cl_emit(f, 1, n, 0, 0, no_args, "")
+]
+
+!!! Stala f64.
+fun cl_fconst(f: Int, x: Float) -> Int [
+    let bits = 0
+    native {Rust} [
+        bits = x.to_bits() as i64;
+    ]
+    let no_args: List<Int> = []
+    end cl_emit(f, 2, bits, 0, 0, no_args, "")
+]
+
+fun cl_binop(f: Int, kind: Int, a: Int, b: Int) -> Int [
+    let no_args: List<Int> = []
+    end cl_emit(f, 3, kind, a, b, no_args, "")
+]
+
+fun cl_iadd(f: Int, a: Int, b: Int) -> Int [
+    end cl_binop(f, 0, a, b)
+]
+
+fun cl_isub(f: Int, a: Int, b: Int) -> Int [
+    end cl_binop(f, 1, a, b)
+]
+
+fun cl_imul(f: Int, a: Int, b: Int) -> Int [
+    end cl_binop(f, 2, a, b)
+]
+
+fun cl_sdiv(f: Int, a: Int, b: Int) -> Int [
+    end cl_binop(f, 3, a, b)
+]
+
+fun cl_udiv(f: Int, a: Int, b: Int) -> Int [
+    end cl_binop(f, 4, a, b)
+]
+
+fun cl_srem(f: Int, a: Int, b: Int) -> Int [
+    end cl_binop(f, 5, a, b)
+]
+
+fun cl_urem(f: Int, a: Int, b: Int) -> Int [
+    end cl_binop(f, 6, a, b)
+]
+
+fun cl_band(f: Int, a: Int, b: Int) -> Int [
+    end cl_binop(f, 7, a, b)
+]
+
+fun cl_bor(f: Int, a: Int, b: Int) -> Int [
+    end cl_binop(f, 8, a, b)
+]
+
+fun cl_bxor(f: Int, a: Int, b: Int) -> Int [
+    end cl_binop(f, 9, a, b)
+]
+
+fun cl_ishl(f: Int, a: Int, b: Int) -> Int [
+    end cl_binop(f, 10, a, b)
+]
+
+fun cl_sshr(f: Int, a: Int, b: Int) -> Int [
+    end cl_binop(f, 11, a, b)
+]
+
+fun cl_ushr(f: Int, a: Int, b: Int) -> Int [
+    end cl_binop(f, 12, a, b)
+]
+
+fun cl_fadd(f: Int, a: Int, b: Int) -> Int [
+    end cl_binop(f, 13, a, b)
+]
+
+fun cl_fsub(f: Int, a: Int, b: Int) -> Int [
+    end cl_binop(f, 14, a, b)
+]
+
+fun cl_fmul(f: Int, a: Int, b: Int) -> Int [
+    end cl_binop(f, 15, a, b)
+]
+
+fun cl_fdiv(f: Int, a: Int, b: Int) -> Int [
+    end cl_binop(f, 16, a, b)
+]
+
+fun cl_unop(f: Int, kind: Int, a: Int) -> Int [
+    let no_args: List<Int> = []
+    end cl_emit(f, 4, kind, a, 0, no_args, "")
+]
+
+fun cl_ineg(f: Int, a: Int) -> Int [
+    end cl_unop(f, 0, a)
+]
+
+fun cl_bnot(f: Int, a: Int) -> Int [
+    end cl_unop(f, 1, a)
+]
+
+fun cl_fneg(f: Int, a: Int) -> Int [
+    end cl_unop(f, 2, a)
+]
+
+fun cl_fsqrt(f: Int, a: Int) -> Int [
+    end cl_unop(f, 3, a)
+]
+
+fun cl_fabs(f: Int, a: Int) -> Int [
+    end cl_unop(f, 4, a)
+]
+
+!!! i64 -> f64 (ze znakiem).
+fun cl_i2f(f: Int, a: Int) -> Int [
+    end cl_unop(f, 5, a)
+]
+
+!!! f64 -> i64 (ze znakiem, z nasyceniem; NaN -> 0).
+fun cl_f2i(f: Int, a: Int) -> Int [
+    end cl_unop(f, 6, a)
+]
+
+!!! Wynik porownania (i8, 0/1) -> i64.
+fun cl_b2i(f: Int, a: Int) -> Int [
+    end cl_unop(f, 7, a)
+]
+
+!!! Kod warunku porownania; kind "icmp" albo "fcmp". icmp: eq ne slt sle
+!!! sgt sge ult ule ugt uge; fcmp: eq ne lt le gt ge. -1 gdy nieznany.
+fun cl_cond_code(kind: Str, cond: Str) -> Int [
+    let code = -1
+    native {Rust} [
+        let names: Vec<&str> = if kind.as_str() == "icmp" {
+            vec!["eq", "ne", "slt", "sle", "sgt", "sge", "ult", "ule", "ugt", "uge"]
+        } else {
+            vec!["eq", "ne", "lt", "le", "gt", "ge"]
+        };
+        if let Some(pos) = names.iter().position(|n| *n == cond.as_str()) {
+            code = pos as i64;
+        }
+    ]
+    end code
+]
+
+!!! Porownanie i64 -> wartosc i8 (uzyj w cl_brif/cl_select albo cl_b2i).
+fun cl_icmp(f: Int, cond: Str, a: Int, b: Int) -> Int [
+    let no_args: List<Int> = []
+    end cl_emit(f, 5, cl_cond_code("icmp", cond.clone()), a, b, no_args, "")
+]
+
+!!! Porownanie f64 -> wartosc i8.
+fun cl_fcmp(f: Int, cond: Str, a: Int, b: Int) -> Int [
+    let no_args: List<Int> = []
+    end cl_emit(f, 6, cl_cond_code("fcmp", cond.clone()), a, b, no_args, "")
+]
+
+!!! `cond` ? a : b (cond to wynik cl_icmp/cl_fcmp).
+fun cl_select(f: Int, cond: Int, a: Int, b: Int) -> Int [
+    let no_args: List<Int> = []
+    end cl_emit(f, 7, cond, a, b, no_args, "")
+]
+
+!!! Skok do bloku z argumentami (numery wartosci).
+fun cl_jump(f: Int, block: Int, args: List<Int>) -> Int [
+    end cl_emit(f, 9, block, 0, 0, args, "")
+]
+
+!!! Skok warunkowy: cond != 0 -> then_block(then_args), inaczej
+!!! else_block(else_args).
+fun cl_brif(f: Int, cond: Int, then_block: Int, then_args: List<Int>, else_block: Int, else_args: List<Int>) -> Int [
+    let all: List<Int> = []
+    native {Rust} [
+        let mut joined: Vec<i64> = then_args.clone();
+        joined.push(-1);
+        joined.extend(else_args.iter().copied());
+        all = joined;
+    ]
+    end cl_emit(f, 10, cond, then_block, else_block, all, "")
+]
+
+!!! Zwraca wartosc `value` z funkcji.
+fun cl_return(f: Int, value: Int) -> Int [
+    let no_args: List<Int> = []
+    end cl_emit(f, 11, value, 0, 0, no_args, "")
+]
+
+!!! Powrot z funkcji bez wyniku.
+fun cl_return_void(f: Int) -> Int [
+    let no_args: List<Int> = []
+    end cl_emit(f, 11, -1, 0, 0, no_args, "")
+]
+
+!!! Wola inna funkcje modulu (zadeklarowana cl_declare albo zbudowana
+!!! wczesniej / ta sama przy rekurencji - po cl_declare). Zwraca numer
+!!! wartosci wyniku.
+fun cl_call(f: Int, callee: Str, args: List<Int>) -> Int [
+    end cl_emit(f, 12, 0, 0, 0, args, callee)
+]
