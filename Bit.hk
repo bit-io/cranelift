@@ -1,1 +1,21 @@
+[package]
+-> name        => cranelift
+-> version     => 0.1.0
+-> description => Cranelift (JIT) bindings for HackerScript (the shim itself is written in HackerScript)
+-> authors     => ["Bit Developers"]
+-> license     => MIT
+-> lang        => HackerScript
 
+[layout]
+-> lib => lib
+
+[lib]
+-> output => hlib
+
+[build]
+-> link => static
+
+[commands]
+-> jit
+--> run => cd examples/jit && virus build --release
+--> description => Build examples/jit (JIT-compiles add, factorial and hypot at runtime)
